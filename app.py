@@ -40,6 +40,10 @@ DOMAIN_NAME = r'^[a-zA-Z\d-]{,63}(\.[a-zA-Z\d-]{,63})*$'
 
 SIMULATE_RANDOMIZE_FREQUENCY = 0.05
 
+#A list of strings that indicate the line should be ignored in the WHOIS response
+WHOIS_LINES_IGNORE = ('Last update of WHOIS database',
+                      'WHOIS lookup made at ')
+
 class NoCachedRecordError(Exception):
     """No previous WHOIS record cached for this domain"""
     pass
@@ -48,10 +52,13 @@ def remove_dynamic_line(whois_record):
     """Remove the line from the record that changes per query"""
     result = ''
     for line in whois_record.split("\n"):
-        #print "DEBUG: remove_dynamic_line: line=%s" % line
-        #this line changes per query and should be ignored
-        if re.search('Last update of WHOIS database', line, flags=re.IGNORECASE) is None:
-            if result == '':
+        ignore = False
+        for ignore_line in WHOIS_LINES_IGNORE:
+            if re.search(ignore_line, line, flags=re.IGNORECASE) is not None:
+                ignore = True
+                break
+        if not ignore:
+            if result == '': #first non-ignored line in record
                 result = line
             else:
                 result = "\n".join([result, line])
