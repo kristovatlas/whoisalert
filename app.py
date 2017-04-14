@@ -2,7 +2,10 @@
 
 Usage:
 
-    $ python app.py [--simulate] domainlist.txt recipient@example.com
+    $ python app.py [--simulate_change] [--simulate_cooldown n] domainlist.txt recipient@example.com
+
+Either the --simulate_change option or the --simluate_cooldown option may be
+used, but not both simultaneously.
 
 Expects the following environment variables set:
 
@@ -29,6 +32,8 @@ import re
 import subprocess
 import random
 
+import db #db.py
+
 LOG_FILENAME = 'whoisalert.log'
 DEFAULT_SMTP_SERVER = 'smtp.gmail.com'
 DEFAULT_SMTP_PORT = 465
@@ -43,6 +48,15 @@ SIMULATE_RANDOMIZE_FREQUENCY = 0.05
 #A list of strings that indicate the line should be ignored in the WHOIS response
 WHOIS_LINES_IGNORE = ('Last update of WHOIS database',
                       'WHOIS lookup made at ')
+
+#A list of strings that indicate a line is alerting quota is exceeded
+WHOIS_LINES_COOLDOWN = ('The WHOIS query quota',)
+
+NO_COOLDOWN = -1
+
+class DomainOnCooldownError(Exception):
+    """A previous WHOIS record response indicated this domain is on cooldown. Wait."""
+    pass
 
 class NoCachedRecordError(Exception):
     """No previous WHOIS record cached for this domain"""
@@ -91,9 +105,22 @@ def get_env(env_var_name, use_default=False):
         sys.exit(msg)
     return val
 
-def get_whois_cache_filename(domain):
-    """Get the filename used to store last seen WHIOS record"""
-    return ''.join([domain, '.txt'])
+def send_cooldown_notification(recipient, domain, cooldown_sec):
+    """Send email alerting that domain is on cooldown for WHOIS lookups"""
+    smtp_auth = dict()
+    smtp_auth['username'] = get_env('WHOISALERT_SMTP_USERNAME')
+    smtp_auth['password'] = get_env('WHOISALERT_SMTP_PASSWORD')
+    smtp_auth['server'] = get_env('WHOISALERT_SMTP_SERVER', use_default=True)
+    smtp_auth['port'] = get_env('WHOISALERT_SMTP_PORT', use_default=True)
+
+    subject = 'INFO: WHOIS queries for {0} are on cooldown for {1} second(s)'.format(
+        domain, str(cooldown_sec))
+    body = ('WHOIS records cannot be retrieved for {0} for {1} more second(s). '
+            'This is your only notification during this period. Consider '
+            'querying less often for the affected domain to avoid blind '
+            'periods.').format(domain, cooldown_sec)
+
+    send_email(smtp_auth, recipient, subject, body)
 
 def send_alert(recipient, affected_domain_diffs):
     """Send email alert
@@ -167,25 +194,42 @@ def log(msg, level=logging.INFO):
     else:
         raise ValueError(str(level))
 
-def whois(domain):
+def whois(domain, db_con=None):
     """Get WHOIS record as string for domain"""
-    cmd = 'whois {0}'.format(domain)
-    return _get_command_result(cmd)
+    rem = cooldown_remaining(domain=domain, db_con=db_con)
+    if rem > 0:
+        msg = "Domain {0} has {1} seconds remaining on its query cooldown.".format(
+            domain, rem)
+        print msg
+        log(msg)
+        raise DomainOnCooldownError()
+    else:
+        cmd = 'whois {0}'.format(domain)
+        return _get_command_result(cmd)
 
-def get_last_whois(domain):
+def get_last_whois(domain, db_con=None):
     """Get the last cached copy of the WHOIS record"""
-    filename = get_whois_cache_filename(domain)
-    if not os.path.isfile(filename):
-        raise NoCachedRecordError()
+    if db_con is None:
+        db_con = db.Datastore()
 
-    with open(filename, 'r') as whois_cached:
-        return whois_cached.read()
+    return db_con.get_record(domain=domain)
 
-def set_last_whois(domain, record):
+def set_last_whois(domain, record, db_con=None):
     """Set the last cached copy of the WHOIS record"""
-    filename = get_whois_cache_filename(domain)
-    with open(filename, 'w') as whois_cached:
-        whois_cached.write(record)
+    if db_con is None:
+        db_con = db.Datastore()
+
+    db_con.set_record(domain=domain, record=record)
+
+def cooldown_remaining(domain, db_con=None):
+    """Return # seconds remaining on WHOIS record lookup cooldown"""
+    if db_con is None:
+        db_con = db.Datastore()
+
+    try:
+        return db_con.cooldown_sec_remaining(domain=domain)
+    except db.NoWhoisRecordStoredError:
+        return NO_COOLDOWN
 
 def print_usage(exit_code=0):
     """Print usage string and quit"""
@@ -214,8 +258,36 @@ def random_flips(_str):
                 result = ''.join([result, char])
     return result
 
-def get_affected_domain_diffs(domains, simulate):
-    """Check the list of domains for WHOIS record changes."""
+def get_cooldown_sec_from_record(whois_record):
+    """Given a WHOIS record retrieved remotely, get cooldown remaining if any
+
+    Returns: int: number of seconds remaining on cooldown or -1 if none
+    """
+    for line in whois_record.split("\n"):
+        for quota_line in WHOIS_LINES_COOLDOWN:
+            if re.search(quota_line, line, flags=re.IGNORECASE) is not None:
+                match = re.search(r'replenished in (\d+) second', line)
+                try:
+                    return int(match.group(1))
+                except Exception, err:
+                    #malformed WHOIS response
+                    log(err, level=logging.ERROR)
+                    raise
+
+    return NO_COOLDOWN
+
+def get_affected_domain_diffs(recipient, domains, simulate_change,
+                              simulate_cooldown, db_con=None):
+    """Check the list of domains for WHOIS record changes.
+
+    Args:
+        recipient (str): email recipient
+        domains (List[str]): List of domains to check
+        simulate_change (bool): Whether to simulate a WHOIS record change for
+            all domains
+        simulate_cooldown (int): Number of seconds to simulate a cooldown for
+        db_con (Optional[db.Datastore]): Database connection
+    """
     affected_domain_diffs = {}
     for domain in domains:
         if not is_domain_name(domain):
@@ -223,24 +295,87 @@ def get_affected_domain_diffs(domains, simulate):
             log(msg, level=logging.ERROR)
             exit(msg)
 
-        new = whois(domain)
+        if simulate_cooldown != NO_COOLDOWN:
+            msg = ("Simulating cooldown for {0} seconds for all domains "
+                   "including {1}.").format(simulate_cooldown, domain)
+            print msg
+            log(msg, level=logging.INFO)
+            send_cooldown_notification(recipient=recipient,
+                                       domain=domain,
+                                       cooldown_sec=simulate_cooldown)
+            try:
+                record = db_con.get_record(domain=domain)
+                #re-insert the same record but updat the timestamp for last
+                #fetched.
+                db_con.set_record(domain=domain, record=record)
+                db_con.set_cooldown(
+                    domain=domain, sec_remaining=simulate_cooldown)
+            except db.NoWhoisRecordStoredError:
+                msg = ('Tried to set simulated cooldown but no record stored '
+                       'for {0}. Will store phony record first and retry.').format(
+                           domain)
+                print msg
+                log(msg, level=logging.INFO)
+                record = 'PHONY RECORD'
+                db_con.set_record(domain=domain, record=record)
+                db_con.set_cooldown(
+                    domain=domain, sec_remaining=simulate_cooldown)
+            continue
+
+        new = None
+        try:
+            new = whois(domain, db_con=db_con)
+        except DomainOnCooldownError:
+            #no new data about this domain available
+            continue
+
+        cooldown = get_cooldown_sec_from_record(new)
+        if cooldown != NO_COOLDOWN:
+            #domain is now on cooldown. will skip until this appears to expire
+            msg = ('The quota for queries concerning {0} has been exceeded, '
+                   'and the domain is now on cooldown for {1} seconds. An '
+                   'alert email will be sent once now to {2}').format(
+                       domain, cooldown, recipient)
+            print msg
+            log(msg, level=logging.WARNING)
+            send_cooldown_notification(
+                recipient=recipient, domain=domain, cooldown_sec=cooldown)
+            try:
+                #Note: Good to update record here, but in doing so we also
+                #achieve the requirement of updating the last_fetched timestamp.
+                db_con.set_record(domain=domain, record=new)
+                db_con.set_cooldown(domain=domain, sec_remaining=cooldown)
+            except db.NoWhoisRecordStoredError:
+                msg = ('Tried to set cooldown but no record stored for {0}. '
+                       'Will store record first and retry.').format(domain)
+                print msg
+                log(msg, level=logging.INFO)
+                db_con.set_record(domain=domain, record=new)
+                db_con.set_cooldown(domain=domain, sec_remaining=cooldown)
+            continue
+
         cached = ''
-        if simulate:
+        if simulate_change:
             #Simulate a change to WHOIS record by flipping some random
             #characters in the current version of the WHOIS record
-            log('Performing simulated modification of WHOIS record for {0}'.format(
-                domain))
+            msg = 'Performing simulated modification of WHOIS record for {0}'.format(
+                domain)
+            print msg
+            log(msg)
             cached = random_flips(remove_dynamic_line(new))
         else:
             try:
-                cached = get_last_whois(domain)
+                cached = get_last_whois(domain=domain, db_con=db_con)
             except NoCachedRecordError:
-                set_last_whois(domain, new)
+                set_last_whois(domain=domain, record=new, db_con=db_con)
                 log('No previous whois record cached for {0}.'.format(
                     domain))
                 continue #no previous record, skip
         diff = get_diff(cached, new)
-        set_last_whois(domain, new) #cache for next comparison
+
+        #cache for next comparison
+        set_last_whois(domain=domain, record=new, db_con=db_con)
+
         if diff != '':
             affected_domain_diffs[domain] = diff
             log('Whois record for {0} has been modified.'.format(domain))
@@ -252,17 +387,27 @@ def _main():
     try:
         domainlist_filename = None
         recipient = None
-        simulate = False
+        simulate_change = False
+        simulated_cooldown_sec = NO_COOLDOWN
 
         if len(sys.argv) == 3:
             domainlist_filename = sys.argv[1]
             recipient = sys.argv[2]
         elif len(sys.argv) == 4:
-            if sys.argv[1] != '--simulate':
+            if sys.argv[1] != '--simulate_change':
                 print_usage(1)
-            simulate = True
+            simulate_change = True
             domainlist_filename = sys.argv[2]
             recipient = sys.argv[3]
+        elif len(sys.argv) == 5:
+            if sys.argv[1] != '--simulate_cooldown':
+                print_usage(1)
+            try:
+                simulated_cooldown_sec = int(sys.argv[2])
+            except ValueError:
+                print_usage(1)
+            domainlist_filename = sys.argv[3]
+            recipient = sys.argv[4]
         else:
             print_usage(1)
 
@@ -275,7 +420,12 @@ def _main():
             for line in domainlist.readlines():
                 domains.append(line.strip())
 
-        affected_domain_diffs = get_affected_domain_diffs(domains, simulate)
+        db_con = db.Datastore()
+
+        affected_domain_diffs = get_affected_domain_diffs(
+            recipient=recipient, domains=domains,
+            simulate_change=simulate_change,
+            simulate_cooldown=simulated_cooldown_sec, db_con=db_con)
 
         if len(affected_domain_diffs) > 0:
             send_alert(recipient, affected_domain_diffs)
@@ -288,7 +438,8 @@ def _main():
             log(msg)
 
     except Exception, err:
-        log('Uncaught exception: {0}'.format(err), level=logging.ERROR)
+        log('Uncaught exception: {0}'.format(str(err)), level=logging.ERROR)
+        raise
 
 if __name__ == '__main__':
     _main()

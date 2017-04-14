@@ -63,6 +63,27 @@ class AppTest(unittest.TestCase):
         For more information on Whois status codes, please visit https://icann.org/epp"""
         self.assertEqual(app.remove_dynamic_line(record2), expected2)
 
+    def test_get_cooldown_sec_from_record(self):
+        """Parse record containing cooldown info"""
+        #From:
+        #http://registrars.nominet.uk/namespace/uk/registration-and-domain-management/query-tools/whois/detailed-instructions
+        record = (
+            '    Error for "<domain name>". The WHOIS query quota for '
+            '<xxx.xxx.xxx.xxx> has been exceeded and will be replenished in '
+            '143 seconds.     \n'
+            '    WHOIS lookup made at <hh:mm:ss dd-mmm-yyyy> -- '
+            '<copyright text>')
+        cooldown = 143
+        self.assertEqual(app.get_cooldown_sec_from_record(record), cooldown)
+
+    def test_get_cooldown_sec_from_record_negative(self):
+        """Should return -1 if record does not contain a cooldown error"""
+        record = """URL of the ICANN Whois Inaccuracy Complaint Form: https://www.icann.org/wicf/
+        >>> Last update of WHOIS database: 2017-04-05T23:14:14Z <<<
+
+        For more information on Whois status codes, please visit https://icann.org/epp"""
+
+        self.assertEqual(app.get_cooldown_sec_from_record(record), app.NO_COOLDOWN)
 
     def test_random_flips(self):
         """First character should be incremented by 1 in value"""
