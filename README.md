@@ -5,7 +5,7 @@ domains changes.
 
 ## Usage
 
-    $ python app.py [--simulate_change] [--simulate_cooldown n] domainlist.txt recipient@example.com
+    $ python app.py [--simulate_change] [--simulate_cooldown n] domainlist.txt recipientlist.csv
 
 Expects the following environment variables set:
 
@@ -26,6 +26,27 @@ enforces a cooldown period of `n` seconds before it will give updated data.
 
 Either the `--simulate_change` option or the `--simluate_cooldown` option may
 be used, but not both simultaneously.
+
+The first required argument (e.g. 'domainlist.txt') is a newline-separated
+(`0x0A`) text file. The second required argument (e.g. 'recipientlist.csv') is
+CSV file with commas that separate columns and newline that separates rows. For
+each row, the first value is the recipient identifier, and the second value is
+the communication channel. Currently, only email is supported as a communication
+channel.
+
+example domainlist.txt:
+```
+google.com
+yahoo.com
+blockchain.info
+```
+
+example recipientlist.csv:
+```
+adam@example.com,email
+barbara@example.com,email
+charles@exaple.com,email
+```
 
 ## Requirements
 
